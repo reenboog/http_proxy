@@ -1,13 +1,14 @@
 use std::str::FromStr;
 
 use httparse::Status;
+use tokio::io::AsyncRead;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-const MAX_HEADERS_PER_REQ: u8 = 32;
+const MAX_HEADERS_PER_REQ: usize = 32;
 const MAX_HEADER_BYTES: usize = 8 * 1024;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Method {
 	Connect,
 }
@@ -80,35 +81,36 @@ impl From<InvalidMethod> for ParseError {
 	}
 }
 
-// returns method, path & leftover.len(), if any
-fn parse_req_from_buf(buf: &[u8], max_headers: u8) -> Result<(Method, String, usize), ParseError> {
-	let mut headers = vec![httparse::EMPTY_HEADER; max_headers as usize];
+// returns method, path & bytes_parsed.len(), if any
+fn parse_req_from_buf(
+	buf: &[u8],
+	max_headers: usize,
+) -> Result<(Method, String, usize), ParseError> {
+	let mut headers = vec![httparse::EMPTY_HEADER; max_headers];
 	let mut req = httparse::Request::new(&mut headers);
 
 	match req.parse(buf) {
-		Ok(Status::Complete(leftover)) => {
-			let method = req
-				.method
-				.ok_or(ParseError::NoMethod)?
-				.to_string()
-				.as_str()
-				.try_into()?;
+		Ok(Status::Complete(parsed_len)) => {
+			let method = Method::from_str(req.method.ok_or(ParseError::NoMethod)?)?;
 			// we assume port is always specified, so path is used directly, though
 			// a check could be introduced for a more verbose output, in case of errors
 			let path = req.path.ok_or(ParseError::NoPath)?.to_string();
 
-			Ok((method, path, leftover))
+			Ok((method, path, parsed_len))
 		}
 		Ok(Status::Partial) => Err(ParseError::Incomplete),
 		Err(e) => Err(ParseError::Invalid { e: e.to_string() }),
 	}
 }
 
-async fn read_and_parse_req(
-	client: &mut TcpStream,
-	max_headers_per_req: u8,
+async fn read_and_parse_req<Stream>(
+	client: &mut Stream,
+	max_headers_per_req: usize,
 	max_header_bytes: usize,
-) -> Result<(Method, String, Option<Vec<u8>>), ParseError> {
+) -> Result<(Method, String, Option<Vec<u8>>), ParseError>
+where
+	Stream: AsyncRead + Unpin,
+{
 	let mut buf = vec![0u8; max_header_bytes];
 	let mut read = 0usize;
 
@@ -137,9 +139,9 @@ async fn read_and_parse_req(
 		read += n;
 
 		match parse_req_from_buf(&buf[..read], max_headers_per_req) {
-			Ok((method, path, leftover_len)) => {
-				let leftover = if leftover_len > 0 {
-					Some(buf[leftover_len..read].to_vec())
+			Ok((method, path, parsed_len)) => {
+				let leftover = if read > parsed_len {
+					Some(buf[parsed_len..read].to_vec())
 				} else {
 					None
 				};
@@ -207,8 +209,36 @@ async fn write_response(stream: &mut TcpStream, code: &str, reason: &str) -> std
 
 #[cfg(test)]
 mod tests {
+	use crate::{MAX_HEADERS_PER_REQ, Method, ParseError, parse_req_from_buf};
+
 	#[test]
 	fn test_ok() {
 		assert!(true)
+	}
+
+	#[test]
+	fn test_parse_req_from_buf_normal() {
+		let raw = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+		let (method, path, parsed_len) = parse_req_from_buf(raw, MAX_HEADERS_PER_REQ).unwrap();
+
+		assert_eq!(method, Method::Connect);
+		assert_eq!(path, "example.com:443");
+		assert_eq!(parsed_len, raw.len());
+	}
+
+	#[test]
+	fn test_parse_req_from_bug_with_leftover() {
+		let raw = b"CONNECT example.com:443 HTTP/1.1\r\n\r\nTLSBYTES";
+		let (_method, _path, parsed_len) = parse_req_from_buf(raw, 32).unwrap();
+
+		assert_eq!(parsed_len, raw.len() - "TLSBYTES".len());
+	}
+
+	#[test]
+	fn test_parse_req_from_bytes_incorrect_method() {
+		let raw = b"GET / HTTP/1.1\r\n\r\n";
+		let err = parse_req_from_buf(raw, 32).err();
+
+		assert_eq!(err, Some(ParseError::InvalidMethod));
 	}
 }
