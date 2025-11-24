@@ -34,6 +34,8 @@ impl FromStr for Method {
 	}
 }
 
+// TODO: introduce authorization?
+
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
 	// TODO: add a connection limiter probably
@@ -91,6 +93,7 @@ fn parse_req_from_buf(
 
 	match req.parse(buf) {
 		Ok(Status::Complete(parsed_len)) => {
+			// if there's an error, httparse will freak out sooner, but let's keep these two errors for readability
 			let method = Method::from_str(req.method.ok_or(ParseError::NoMethod)?)?;
 			// we assume port is always specified, so path is used directly, though
 			// a check could be introduced for a more verbose output, in case of errors
@@ -209,15 +212,11 @@ async fn write_response(stream: &mut TcpStream, code: &str, reason: &str) -> std
 
 #[cfg(test)]
 mod tests {
-	use crate::{MAX_HEADERS_PER_REQ, Method, ParseError, parse_req_from_buf};
+	use super::*;
+	use std::io::Cursor;
 
 	#[test]
-	fn test_ok() {
-		assert!(true)
-	}
-
-	#[test]
-	fn test_parse_req_from_buf_normal() {
+	fn test_parse_connect_ok() {
 		let raw = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
 		let (method, path, parsed_len) = parse_req_from_buf(raw, MAX_HEADERS_PER_REQ).unwrap();
 
@@ -227,18 +226,122 @@ mod tests {
 	}
 
 	#[test]
-	fn test_parse_req_from_bug_with_leftover() {
+	fn test_parse_connect_with_leftover() {
 		let raw = b"CONNECT example.com:443 HTTP/1.1\r\n\r\nTLSBYTES";
-		let (_method, _path, parsed_len) = parse_req_from_buf(raw, 32).unwrap();
+		let (_method, _path, parsed_len) = parse_req_from_buf(raw, MAX_HEADERS_PER_REQ).unwrap();
 
 		assert_eq!(parsed_len, raw.len() - "TLSBYTES".len());
 	}
 
 	#[test]
-	fn test_parse_req_from_bytes_incorrect_method() {
+	fn test_parse_incorrect_method() {
 		let raw = b"GET / HTTP/1.1\r\n\r\n";
-		let err = parse_req_from_buf(raw, 32).err();
+		let err = parse_req_from_buf(raw, MAX_HEADERS_PER_REQ).unwrap_err();
 
-		assert_eq!(err, Some(ParseError::InvalidMethod));
+		assert_eq!(err, ParseError::InvalidMethod);
+	}
+
+	#[tokio::test]
+	async fn test_read_and_parse_simple_connect_no_leftover() {
+		let raw = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+		let mut cursor = Cursor::new(&raw[..]);
+
+		let (method, path, leftover) =
+			read_and_parse_req(&mut cursor, MAX_HEADERS_PER_REQ, MAX_HEADER_BYTES)
+				.await
+				.unwrap();
+
+		assert_eq!(method, Method::Connect);
+		assert_eq!(path, "example.com:443");
+		assert!(leftover.is_none());
+	}
+
+	#[tokio::test]
+	async fn test_read_and_parse_connect_with_leftover_bytes() {
+		let raw = b"CONNECT example.com:443 HTTP/1.1\r\n\r\nTLSBYTES";
+		let mut cursor = Cursor::new(&raw[..]);
+
+		let (method, path, leftover) =
+			read_and_parse_req(&mut cursor, MAX_HEADERS_PER_REQ, MAX_HEADER_BYTES)
+				.await
+				.unwrap();
+
+		assert_eq!(method, Method::Connect);
+		assert_eq!(path, "example.com:443");
+
+		let leftover = leftover.expect("expected leftover bytes");
+		assert_eq!(leftover, b"TLSBYTES");
+	}
+
+	#[tokio::test]
+	async fn test_read_and_parse_closed_before_any_data() {
+		let raw = b"";
+		let mut cursor = Cursor::new(&raw[..]);
+
+		let res = read_and_parse_req(&mut cursor, MAX_HEADERS_PER_REQ, MAX_HEADER_BYTES).await;
+		assert_eq!(res.unwrap_err(), ParseError::Closed);
+	}
+
+	#[tokio::test]
+	async fn test_read_and_parse_eof_mid_request() {
+		// no closing \r\n\r\n -> partial parsing -> eof
+		let raw = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n";
+		let mut cursor = Cursor::new(&raw[..]);
+
+		let res = read_and_parse_req(&mut cursor, MAX_HEADERS_PER_REQ, MAX_HEADER_BYTES).await;
+		assert!(matches!(res, Err(ParseError::Invalid { e }) if e == "eof"));
+	}
+
+	#[tokio::test]
+	async fn test_read_and_parse_req_too_large() {
+		let raw = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n";
+		let mut cursor = Cursor::new(&raw[..]);
+
+		let res = read_and_parse_req(&mut cursor, MAX_HEADERS_PER_REQ, 16).await;
+		assert_eq!(res.unwrap_err(), ParseError::ReqTooLarge);
+	}
+
+	#[tokio::test]
+	async fn test_read_and_parse_invalid_method_propagates() {
+		let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+		let mut cursor = Cursor::new(&raw[..]);
+
+		let res = read_and_parse_req(&mut cursor, MAX_HEADERS_PER_REQ, MAX_HEADER_BYTES).await;
+		assert_eq!(res.unwrap_err(), ParseError::InvalidMethod);
+	}
+
+	#[tokio::test]
+	async fn test_read_and_parse_no_path() {
+		// an empty space instead of a path
+		let raw = b"CONNECT  HTTP/1.1\r\nHost: example.com\r\n\r\n";
+		let mut cursor = Cursor::new(&raw[..]);
+
+		let res = read_and_parse_req(&mut cursor, MAX_HEADERS_PER_REQ, MAX_HEADER_BYTES).await;
+		assert!(matches!(res, Err(ParseError::Invalid { e: _e })));
+	}
+
+	use std::io;
+	use std::pin::Pin;
+	use std::task::{Context, Poll};
+	use tokio::io::ReadBuf;
+
+	struct BrokenPipeReader;
+
+	impl AsyncRead for BrokenPipeReader {
+		fn poll_read(
+			self: Pin<&mut Self>,
+			_cx: &mut Context<'_>,
+			_buf: &mut ReadBuf<'_>,
+		) -> Poll<io::Result<()>> {
+			Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, "boom")))
+		}
+	}
+
+	#[tokio::test]
+	async fn test_read_and_parse_io_error() {
+		let mut reader = BrokenPipeReader;
+
+		let res = read_and_parse_req(&mut reader, MAX_HEADERS_PER_REQ, MAX_HEADER_BYTES).await;
+		assert!(matches!(res, Err(ParseError::Io { e }) if e == "boom"));
 	}
 }
