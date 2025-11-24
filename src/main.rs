@@ -1,3 +1,214 @@
-fn main() {
-    println!("Hello, world!");
+use std::str::FromStr;
+
+use httparse::Status;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+
+const MAX_HEADERS_PER_REQ: u8 = 32;
+const MAX_HEADER_BYTES: usize = 8 * 1024;
+
+#[derive(Debug)]
+enum Method {
+	Connect,
+}
+
+struct InvalidMethod;
+
+impl TryFrom<&str> for Method {
+	type Error = InvalidMethod;
+
+	fn try_from(val: &str) -> Result<Self, Self::Error> {
+		match val {
+			"CONNECT" => Ok(Self::Connect),
+			_ => Err(InvalidMethod),
+		}
+	}
+}
+
+impl FromStr for Method {
+	type Err = InvalidMethod;
+
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		TryFrom::try_from(s)
+	}
+}
+
+#[tokio::main]
+async fn main() -> std::io::Result<()> {
+	// TODO: add a connection limiter probably
+	let ip = "127.0.0.1";
+	let port = 8080;
+	let addr = format!("{ip}:{port}");
+
+	println!("starting on {addr}...");
+
+	let listener = TcpListener::bind(addr).await?;
+
+	loop {
+		match listener.accept().await {
+			Ok((stream, addr)) => {
+				println!("accepted {addr}, handling...");
+
+				tokio::spawn(async move {
+					if let Err(er) = handle_connection(stream).await {
+						eprintln!("connect failed: {}, {:?}", addr, er);
+
+						// TODO: write back an error properly + respect the code somehow (get from the error?)
+					}
+				});
+			}
+			Err(e) => eprintln!("accept failed: {}", e),
+		}
+	}
+}
+
+#[derive(PartialEq, Debug)]
+enum ParseError {
+	NoMethod,
+	InvalidMethod,
+	NoPath,
+	Incomplete,
+	Closed,
+	Invalid { e: String },
+	ReqTooLarge,
+	Io { e: String },
+}
+
+impl From<InvalidMethod> for ParseError {
+	fn from(_val: InvalidMethod) -> Self {
+		ParseError::InvalidMethod
+	}
+}
+
+// returns method, path & leftover.len(), if any
+fn parse_req_from_buf(buf: &[u8], max_headers: u8) -> Result<(Method, String, usize), ParseError> {
+	let mut headers = vec![httparse::EMPTY_HEADER; max_headers as usize];
+	let mut req = httparse::Request::new(&mut headers);
+
+	match req.parse(buf) {
+		Ok(Status::Complete(leftover)) => {
+			let method = req
+				.method
+				.ok_or(ParseError::NoMethod)?
+				.to_string()
+				.as_str()
+				.try_into()?;
+			// we assume port is always specified, so path is used directly, though
+			// a check could be introduced for a more verbose output, in case of errors
+			let path = req.path.ok_or(ParseError::NoPath)?.to_string();
+
+			Ok((method, path, leftover))
+		}
+		Ok(Status::Partial) => Err(ParseError::Incomplete),
+		Err(e) => Err(ParseError::Invalid { e: e.to_string() }),
+	}
+}
+
+async fn read_and_parse_req(
+	client: &mut TcpStream,
+	max_headers_per_req: u8,
+	max_header_bytes: usize,
+) -> Result<(Method, String, Option<Vec<u8>>), ParseError> {
+	let mut buf = vec![0u8; max_header_bytes];
+	let mut read = 0usize;
+
+	// read data until we have METHOD and PATH
+	loop {
+		// eof, but failed to complete parsing = better skip
+		if read == buf.len() {
+			return Err(ParseError::ReqTooLarge);
+		}
+
+		let n = client
+			.read(&mut buf[read..])
+			.await
+			.map_err(|e| ParseError::Io { e: e.to_string() })?;
+		if n == 0 {
+			// connection closed before sending a request
+			if read == 0 {
+				return Err(ParseError::Closed);
+			} else {
+				// eof, but no headers/path yet? something is not right probably
+				return Err(ParseError::Invalid {
+					e: "eof".to_string(),
+				});
+			}
+		}
+		read += n;
+
+		match parse_req_from_buf(&buf[..read], max_headers_per_req) {
+			Ok((method, path, leftover_len)) => {
+				let leftover = if leftover_len > 0 {
+					Some(buf[leftover_len..read].to_vec())
+				} else {
+					None
+				};
+				return Ok((method, path, leftover));
+			}
+			Err(e) => {
+				if ParseError::Incomplete == e {
+					// not enough bytes read to parse a request
+					continue;
+				} else {
+					return Err(e);
+				}
+			}
+		}
+	}
+}
+
+#[derive(Debug)]
+enum ConError {
+	Parse(ParseError),
+	Io(String),
+}
+
+impl From<ParseError> for ConError {
+	fn from(val: ParseError) -> Self {
+		Self::Parse(val)
+	}
+}
+
+impl From<std::io::Error> for ConError {
+	fn from(val: std::io::Error) -> Self {
+		Self::Io(val.to_string())
+	}
+}
+
+async fn handle_connection(mut client: TcpStream) -> Result<(), ConError> {
+	let (method, path, leftover) =
+		read_and_parse_req(&mut client, MAX_HEADERS_PER_REQ, MAX_HEADER_BYTES).await?;
+
+	println!(
+		"handling {:?} to {path} from {:?}",
+		method,
+		client.peer_addr()
+	);
+
+	// connect to the target host
+	let mut upstream = TcpStream::connect(&path).await?;
+
+	client.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await?;
+
+	// in case parsing produced any leftover bytes, write them all, if any (none in most cases)
+	if let Some(leftover) = leftover {
+		upstream.write_all(&leftover).await?;
+	}
+
+	tokio::io::copy_bidirectional(&mut client, &mut upstream).await?;
+
+	Ok(())
+}
+
+async fn write_response(stream: &mut TcpStream, code: &str, reason: &str) -> std::io::Result<()> {
+	let resp = format!("HTTP/1.1 {} {}\r\n\r\n", code, reason);
+	stream.write_all(resp.as_bytes()).await
+}
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn test_ok() {
+		assert!(true)
+	}
 }
