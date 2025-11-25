@@ -1,3 +1,5 @@
+![Rust Build Status](https://github.com/reenboog/http_proxy/workflows/Rust/badge.svg)
+
 A basic http-connect proxy
 
 To test, start the proxy:
